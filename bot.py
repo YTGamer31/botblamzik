@@ -1,234 +1,319 @@
-import sqlite3
-import logging
-from datetime import datetime, date
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
-from aiogram import F
-import asyncio
+"""
+Бот «Блямзики» — игровая экономика для вашей группы
 
-# === НАСТРОЙКА ЛОГИРОВАНИЯ ===
+ОПИСАНИЕ:
+Это Telegram-бот с внутригрупповой валютой «блямзики», который помогает:
+- Мотивировать активность (за полезные действия — +10 блямзиков),
+- Создать внутригрупповую экономику (магазин, переводы, рейтинги),
+- Защищаться от ботов и спама (капча, лимиты, автобан),
+- Упростить модерацию (админка в ЛС, история, уведомления).
+
+ИНСТРУКЦИЯ:
+1. Добавьте бота в группу.
+2. Убедитесь, что у бота есть права администратора (для получения сообщений).
+3. Начните общение с /start.
+4. Используйте команды в группе:
+   - /balance — баланс
+   - /apply_blyamzic причина — заявка на +10 блямзиков (можно с фото/видео)
+   - /shop — магазин
+   - /top — топ-10
+   - /transfer @username 10 — перевести блямзики
+5. Админ-панель: в ЛС бота введите /admin (только для админов).
+
+ПРЕДУПРЕЖДЕНИЕ:
+- Не публикуйте токен бота в открытом виде!
+- Для запуска нужен Python 3.8+ и установленные зависимости.
+"""
+
+import asyncio
+import logging
+import os
+from datetime import date
+from typing import Optional, List, Tuple
+
+import aiosqlite
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+)
+from aiogram.enums import ChatType  # Правильный импорт для aiogram >= 3.10
+from aiogram.exceptions import TelegramForbiddenError
+from dotenv import load_dotenv
+
+# === ЗАГРУЗКА ПЕРЕМЕННЫХ ===
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не указан в .env")
+
+ADMINS = [int(x.strip()) for x in os.getenv("ADMINS", "").split(",") if x.strip()]
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# === ЛОГИРОВАНИЕ ===
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
     handlers=[
         logging.FileHandler("admin_actions.log", encoding="utf-8"),
         logging.StreamHandler()
     ]
 )
+logger = logging.getLogger(__name__)
 
-# Токен бота
-BOT_TOKEN = "8504090327:AAEWPolM5Kb1uRbvJB7dWphbD9nYVzZJc9Q"
-ADMINS = [5171361978,8268613975,2143824530]  # ЗАМЕНИТЕ НА СВОЙ ID
-
-# Инициализация
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-
-# Подключение к базе данных
-conn = sqlite3.connect("blyamzic.db", check_same_thread=False)
-cursor = conn.cursor()
-
-# === КОНСТАНТЫ ===
+# === НАСТРОЙКИ ===
+DB_PATH = "blyamzic.db"
 BACK_BUTTON = "⬅️ Назад"
-SQL_GET_USER_ID_BY_REQ_ID = "SELECT user_id FROM requests WHERE id = ?"
 MSG_ONLY_IN_GROUP = "❌ Эта команда доступна только в группе."
 MSG_ONLY_IN_PRIVATE = "❌ Команда доступна только в личных сообщениях."
 MSG_ACCESS_DENIED = "❌ Доступ запрещён."
-MSG_ONLY_IN_PRIVATE_ALERT = "❌ Команда доступна только в личных сообщениях."
-MSG_ACCESS_DENIED_ALERT = "❌ Доступ запрещён."
 
-# === ФУНКЦИЯ ОБНОВЛЕНИЯ СХЕМЫ БД ===
-def ensure_schema():
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            balance INTEGER DEFAULT 0
+# === БАЗА ДАННЫХ ===
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                balance INTEGER DEFAULT 0
+            )
+        ''')
+
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                username TEXT,
+                reason TEXT,
+                media_id TEXT,
+                media_type TEXT,
+                status TEXT DEFAULT 'pending',
+                admin_id INTEGER
+            )
+        ''')
+
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS shop (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                price INTEGER
+            )
+        ''')
+
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS transfers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_id INTEGER,
+                receiver_id INTEGER,
+                amount INTEGER,
+                date TEXT
+            )
+        ''')
+
+        # Проверка и добавление столбцов, если их нет
+        cursor = await db.execute("PRAGMA table_info(requests)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "media_id" not in columns:
+            await db.execute("ALTER TABLE requests ADD COLUMN media_id TEXT")
+        if "media_type" not in columns:
+            await db.execute("ALTER TABLE requests ADD COLUMN media_type TEXT")
+        await db.commit()
+
+# === ФУНКЦИИ РАБОТЫ С БД ===
+async def get_user_balance(user_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
+
+async def update_balance(user_id: int, amount: int, username: str = "unknown"):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        if row:
+            new_balance = row[0] + amount
+            await db.execute(
+                "UPDATE users SET balance = ?, username = ? WHERE user_id = ?",
+                (new_balance, username, user_id)
+            )
+        else:
+            await db.execute(
+                "INSERT INTO users (user_id, username, balance) VALUES (?, ?, ?)",
+                (user_id, username, amount)
+            )
+        await db.commit()
+        logger.info(f"ADJUST | User: {user_id} (@{username}) | Amount: {amount} | New: {await get_user_balance(user_id)}")
+
+
+async def add_request(user_id: int, username: str, reason: str, media_id: Optional[str] = None, media_type: Optional[str] = None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO requests (user_id, username, reason, media_id, media_type) VALUES (?, ?, ?, ?, ?)",
+            (user_id, username, reason, media_id, media_type)
         )
-    ''')
+        await db.commit()
 
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            username TEXT,
-            reason TEXT,
-            media_id TEXT DEFAULT NULL,
-            media_type TEXT DEFAULT NULL,
-            status TEXT DEFAULT 'pending',
-            admin_id INTEGER DEFAULT NULL
+
+async def get_pending_requests() -> List[Tuple]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, user_id, username, reason, media_id, media_type FROM requests WHERE status = 'pending'"
         )
-    ''')
+        return await cursor.fetchall()
 
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS shop (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            price INTEGER
+
+async def get_request_history(limit: int = 20) -> List[Tuple]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, user_id, username, reason, status, admin_id FROM requests ORDER BY id DESC LIMIT ?",
+            (limit,)
         )
-    ''')
+        return await cursor.fetchall()
 
-    # === НОВАЯ ТАБЛИЦА: история переводов ===
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS transfers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sender_id INTEGER,
-            receiver_id INTEGER,
-            amount INTEGER,
-            date TEXT
+
+async def update_request_status(req_id: int, status: str, admin_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE requests SET status = ?, admin_id = ? WHERE id = ?",
+            (status, admin_id, req_id)
         )
-    ''')
+        if status == 'approved':
+            cursor = await db.execute("SELECT user_id FROM requests WHERE id = ?", (req_id,))
+            row = await cursor.fetchone()
+            if row:
+                await update_balance(row[0], 10)
+                logger.info(f"APPROVE | Request #{req_id} | User: {row[0]} | Admin: {admin_id}")
+        elif status == 'declined':
+            cursor = await db.execute("SELECT user_id FROM requests WHERE id = ?", (req_id,))
+            row = await cursor.fetchone()
+            if row:
+                logger.info(f"DECLINE | Request #{req_id} | User: {row[0]} | Admin: {admin_id}")
+        await db.commit()
 
-    # Проверяем, существуют ли столбцы
-    cursor.execute("PRAGMA table_info(requests)")
-    columns = [row[1] for row in cursor.fetchall()]
-    if 'media_type' not in columns:
-        cursor.execute("ALTER TABLE requests ADD COLUMN media_type TEXT DEFAULT NULL")
-        print("✅ Столбец media_type добавлен в таблицу requests")
-    if 'media_id' not in columns:
-        cursor.execute("ALTER TABLE requests ADD COLUMN media_id TEXT DEFAULT NULL")
-        print("✅ Столбец media_id добавлен в таблицу requests")
 
-    conn.commit()
+async def get_shop_items() -> List[Tuple]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT id, name, price FROM shop")
+        return await cursor.fetchall()
 
-ensure_schema()
 
-def get_user_balance(user_id):
-    cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
-    result = cursor.fetchone()
-    return result[0] if result else 0
+async def add_item_to_shop(name: str, price: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO shop (name, price) VALUES (?, ?)", (name, price))
+        await db.commit()
 
-def update_balance(user_id, amount, username="unknown"):
-    cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
-    result = cursor.fetchone()
-    if result:
-        new_balance = result[0] + amount
-        cursor.execute("UPDATE users SET balance = ?, username = ? WHERE user_id = ?", (new_balance, username, user_id))
-    else:
-        cursor.execute("INSERT INTO users (user_id, username, balance) VALUES (?, ?, ?)", (user_id, username, amount))
-    conn.commit()
-    logging.info(f"ADJUST | User: {user_id} (@{username}) | Amount: {amount} | New: {get_user_balance(user_id)}")
 
-def add_request(user_id, username, reason, media_id=None, media_type=None):
-    cursor.execute("INSERT INTO requests (user_id, username, reason, media_id, media_type) VALUES (?, ?, ?, ?, ?)", (user_id, username, reason, media_id, media_type))
-    conn.commit()
+async def get_top_users(limit: int = 10) -> List[Tuple]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT user_id, username, balance FROM users ORDER BY balance DESC LIMIT ?",
+            (limit,)
+        )
+        return await cursor.fetchall()
 
-def get_pending_requests():
-    cursor.execute("SELECT id, user_id, username, reason, media_id, media_type FROM requests WHERE status = 'pending'")
-    return cursor.fetchall()
 
-def get_request_history(limit=20):
-    cursor.execute("SELECT id, user_id, username, reason, status, admin_id FROM requests ORDER BY id DESC LIMIT ?", (limit,))
-    return cursor.fetchall()
-
-def update_request_status(req_id, status, admin_id):
-    cursor.execute("UPDATE requests SET status = ?, admin_id = ? WHERE id = ?", (status, admin_id, req_id))
-    if status == 'approved':
-        cursor.execute(SQL_GET_USER_ID_BY_REQ_ID, (req_id,))
-        user_id = cursor.fetchone()[0]
-        update_balance(user_id, 10)
-        logging.info(f"APPROVE | Request #{req_id} | User: {user_id} | Admin: {admin_id}")
-    elif status == 'declined':
-        cursor.execute(SQL_GET_USER_ID_BY_REQ_ID, (req_id,))
-        user_id = cursor.fetchone()[0]
-        logging.info(f"DECLINE | Request #{req_id} | User: {user_id} | Admin: {admin_id}")
-    conn.commit()
-
-def get_shop_items():
-    cursor.execute("SELECT id, name, price FROM shop")
-    return cursor.fetchall()
-
-def add_item_to_shop(name, price):
-    cursor.execute("INSERT INTO shop (name, price) VALUES (?, ?)", (name, price))
-    conn.commit()
-
-def get_top_users(limit=10):
-    cursor.execute("SELECT user_id, username, balance FROM users ORDER BY balance DESC LIMIT ?", (limit,))
-    return cursor.fetchall()
-
-def buy_item_by_id(user_id, item_id):
-    items = get_shop_items()
+async def buy_item_by_id(user_id: int, item_id: int) -> Tuple[bool, str]:
+    items = await get_shop_items()
     item = next((i for i in items if i[0] == item_id), None)
     if not item:
         return False, "Товар не найден"
     price = item[2]
-    balance = get_user_balance(user_id)
+    balance = await get_user_balance(user_id)
     if balance < price:
         return False, "Недостаточно блямзиков"
-    update_balance(user_id, -price)
+    await update_balance(user_id, -price)
     return True, f"Вы купили {item[1]}!"
 
-# === ПРОВЕРКИ ===
 
-def is_private_chat(message: Message) -> bool:
-    return message.chat.type == "private"
+async def get_transfer_count_today(sender_id: int, receiver_id: int) -> int:
+    today = date.today().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM transfers WHERE sender_id = ? AND receiver_id = ? AND date = ?",
+            (sender_id, receiver_id, today)
+        )
+        row = await cursor.fetchone()
+        return row[0]
 
-def is_group_chat(message: Message) -> bool:
-    return message.chat.type in ["group", "supergroup"]
+
+async def add_transfer(sender_id: int, receiver_id: int, amount: int):
+    today = date.today().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO transfers (sender_id, receiver_id, amount, date) VALUES (?, ?, ?, ?)",
+            (sender_id, receiver_id, amount, today)
+        )
+        await db.commit()
+
+
+# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
+def is_private(msg: Message) -> bool:
+    return msg.chat.type == ChatType.PRIVATE
+
+
+def is_group(msg: Message) -> bool:
+    return msg.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
+
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMINS
 
-# === НОВАЯ ФУНКЦИЯ: проверка лимита переводов в день ===
-def get_transfer_count_today(sender_id, receiver_id):
-    today = date.today().isoformat()
-    cursor.execute(
-        "SELECT COUNT(*) FROM transfers WHERE sender_id = ? AND receiver_id = ? AND date = ?",
-        (sender_id, receiver_id, today)
-    )
-    return cursor.fetchone()[0]
 
-def add_transfer(sender_id, receiver_id, amount):
-    today = date.today().isoformat()
-    cursor.execute(
-        "INSERT INTO transfers (sender_id, receiver_id, amount, date) VALUES (?, ?, ?, ?)",
-        (sender_id, receiver_id, amount, today)
-    )
-    conn.commit()
-
-# Назад в главное меню
-def back_to_main():
-    return types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text=BACK_BUTTON, callback_data="back_to_main")]
+def back_to_main_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=BACK_BUTTON, callback_data="back_to_main")]
     ])
 
-# === ОБЩИЕ КОМАНДЫ (работают только в группе) ===
+
+# === БОТ И ДИСПЕТЧЕР ===
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+
+# === КОМАНДЫ В ГРУППЕ ===
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    await message.answer("Привет! Это бот для блямзиков. Используй /balance, /apply_blyamzic, /shop.")
+    await message.answer(
+        "👋 Привет! Это бот для блямзиков.\n"
+        "Доступные команды (в группе):\n"
+        "• /balance — баланс\n"
+        "• /apply_blyamzic причина — заявка +10\n"
+        "• /shop — магазин\n"
+        "• /top — топ-10\n"
+        "• /transfer @user 5 — перевести"
+    )
+
 
 @dp.message(Command("balance"))
 async def cmd_balance(message: Message):
-    if not is_group_chat(message):
+    if not is_group(message):
         await message.answer(MSG_ONLY_IN_GROUP)
         return
-    balance = get_user_balance(message.from_user.id)
-    await message.answer(f"Ваш баланс: {balance} блямзиков.")
+    balance = await get_user_balance(message.from_user.id)
+    await message.answer(f"💰 Ваш баланс: **{balance}** блямзиков.", parse_mode="Markdown")
 
-# === Команда /apply_blyamzic с поддержкой медиа ===
+
 @dp.message(Command("apply_blyamzic"))
 async def cmd_apply(message: Message):
-    if not is_group_chat(message):
+    if not is_group(message):
         await message.answer(MSG_ONLY_IN_GROUP)
         return
 
-    # Проверяем, есть ли текст в сообщении
-    if not message.text:
-        await message.answer("❌ Используйте: /apply_blyamzic Причина получения")
+    # Извлечение причины из текста или caption
+    text = message.text or message.caption or ""
+    if not text.startswith("/apply_blyamzic"):
         return
-
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("Используйте: /apply_blyamzic Причина получения")
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("❌ Используйте: `/apply_blyamzic Причина получения`", parse_mode="Markdown")
         return
-    reason = args[1]
+    reason = parts[1]
 
-    # Проверяем, есть ли медиа
-    media_id = None
-    media_type = None
-
+    # Определение медиа
+    media_id = media_type = None
     if message.photo:
         media_id = message.photo[-1].file_id
         media_type = "photo"
@@ -248,575 +333,494 @@ async def cmd_apply(message: Message):
         media_id = message.video_note.file_id
         media_type = "video_note"
 
-    add_request(message.from_user.id, message.from_user.username or "unknown", reason, media_id, media_type)
-    await message.answer("Ваша заявка отправлена на проверку администратору.")
+    await add_request(
+        message.from_user.id,
+        message.from_user.username or "unknown",
+        reason,
+        media_id,
+        media_type
+    )
+    await message.answer("📨 Заявка отправлена администратору на рассмотрение.")
 
-# === НОВАЯ ФУНКЦИЯ: обработка фото/видео с описанием ===
+
 @dp.message(F.photo | F.video | F.document | F.voice | F.audio | F.video_note)
 async def handle_media_with_caption(message: Message):
-    if not is_group_chat(message):
+    """Поддержка /apply_blyamzic в caption медиа"""
+    if not is_group(message) or not message.caption:
         return
-
-    # Проверяем, есть ли описание (caption)
-    if not message.caption:
-        await message.answer("❌ Отправьте фото/видео с описанием, содержащим команду: /apply_blyamzic Причина получения")
-        return
-
-    # Проверяем, начинается ли описание с команды
     if not message.caption.startswith("/apply_blyamzic"):
-        await message.answer("❌ Чтобы отправить заявку, начните описание с команды: /apply_blyamzic Причина получения")
         return
+    # Перенаправляем на команду
+    msg_copy = Message(
+        message_id=message.message_id,
+        date=message.date,
+        chat=message.chat,
+        from_user=message.from_user,
+        caption=message.caption,
+        photo=message.photo,
+        video=message.video,
+        document=message.document,
+        voice=message.voice,
+        audio=message.audio,
+        video_note=message.video_note,
+    )
+    await cmd_apply(msg_copy)
 
-    # Извлекаем причину из описания
-    args = message.caption.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("❌ Используйте: /apply_blyamzic Причина получения")
-        return
-    reason = args[1]
-
-    # Получаем тип и ID медиа
-    media_id = None
-    media_type = None
-
-    if message.photo:
-        media_id = message.photo[-1].file_id
-        media_type = "photo"
-    elif message.video:
-        media_id = message.video.file_id
-        media_type = "video"
-    elif message.document:
-        media_id = message.document.file_id
-        media_type = "document"
-    elif message.voice:
-        media_id = message.voice.file_id
-        media_type = "voice"
-    elif message.audio:
-        media_id = message.audio.file_id
-        media_type = "audio"
-    elif message.video_note:
-        media_id = message.video_note.file_id
-        media_type = "video_note"
-
-    add_request(message.from_user.id, message.from_user.username or "unknown", reason, media_id, media_type)
-    await message.answer("Ваша заявка отправлена на проверку администратору.")
 
 @dp.message(Command("shop"))
 async def cmd_shop(message: Message):
-    if not is_group_chat(message):
+    if not is_group(message):
         await message.answer(MSG_ONLY_IN_GROUP)
         return
-    items = get_shop_items()
+    items = await get_shop_items()
     if not items:
-        await message.answer("Магазин пуст.")
+        await message.answer("🛒 Магазин пуст.")
         return
-    text = "🛍 Магазин блямзиков:\n\n"
-    for item in items:
-        text += f"{item[0]}. {item[1]} — {item[2]} блямзиков\n"  # ✅ Исправлено: было item[0}]
-    text += "\nЧтобы купить, введите номер товара."
-    await message.answer(text)
+    text = "🛍 **Магазин блямзиков**:\n\n"
+    for item_id, name, price in items:
+        text += f"{item_id}. **{name}** — {price} блямзиков\n"
+    text += "\nЧтобы купить — отправьте номер товара."
+    await message.answer(text, parse_mode="Markdown")
 
-# === Обработка ввода номера товара для покупки ===
+
 @dp.message(F.text.isdigit())
-async def handle_number_input(message: Message):
-    if not is_group_chat(message):
+async def handle_item_buy(message: Message):
+    if not is_group(message):
         return
     try:
         item_id = int(message.text)
-        _, msg = buy_item_by_id(message.from_user.id, item_id)  # ✅ Заменено: success -> _
+        success, msg = await buy_item_by_id(message.from_user.id, item_id)
         await message.answer(msg)
-    except Exception:
-        await message.answer("Неверный формат. Введите номер товара из /shop.")
+    except Exception as e:
+        logger.exception("Ошибка при покупке")
+        await message.answer("❌ Ошибка при обработке.")
+
 
 @dp.message(Command("top"))
 async def cmd_top(message: Message):
-    if not is_group_chat(message):
+    if not is_group(message):
         await message.answer(MSG_ONLY_IN_GROUP)
         return
-    top_users = get_top_users()
-    if not top_users:
-        await message.answer("Нет данных для топа.")
+    users = await get_top_users()
+    if not users:
+        await message.answer("📊 Нет данных.")
         return
-    text = "🏆 Топ-10 по блямзикам:\n\n"
-    for i, user in enumerate(top_users, start=1):
-        text += f"{i}. @{user[1] or 'unknown'} — {user[2]} блямзиков\n"
-    await message.answer(text)
+    text = "🏆 **Топ-10 по блямзикам**:\n\n"
+    for i, (uid, uname, bal) in enumerate(users, 1):
+        name = uname or f"id{uid}"
+        text += f"{i}. @{name} — {bal} блямзиков\n"
+    await message.answer(text, parse_mode="Markdown")
 
-# === НОВАЯ ФУНКЦИЯ: перевод блямзиков ===
+
 @dp.message(Command("transfer"))
 async def cmd_transfer(message: Message):
-    if not is_group_chat(message):
+    if not is_group(message):
         await message.answer(MSG_ONLY_IN_GROUP)
         return
 
     args = message.text.split()
     if len(args) != 3:
-        await message.answer("Используйте: /transfer @username количество")
+        await message.answer("❌ Используйте: `/transfer @username количество`", parse_mode="Markdown")
         return
 
-    target_username = args[1]
+    target_username, amount_str = args[1], args[2]
+    if not target_username.startswith("@") or len(target_username) < 2:
+        await message.answer("❌ Неверный формат юзернейма.")
+        return
+
     try:
-        amount = int(args[2])
+        amount = int(amount_str)
     except ValueError:
-        await message.answer("Количество должно быть числом.")
+        await message.answer("❌ Количество должно быть целым числом.")
         return
 
     if amount <= 0:
-        await message.answer("Переводить можно только положительное количество.")
+        await message.answer("❌ Сумма должна быть положительной.")
         return
 
     sender_id = message.from_user.id
-    sender_balance = get_user_balance(sender_id)
-
+    sender_balance = await get_user_balance(sender_id)
     if sender_balance < amount:
-        await message.answer("❌ Недостаточно блямзиков для перевода.")
+        await message.answer("❌ Недостаточно блямзиков.")
         return
 
-    # === ПРОВЕРКА ЛИМИТА: 3 перевода в день ===
-    cursor.execute("SELECT user_id FROM users WHERE username = ?", (target_username[1:],))
-    receiver = cursor.fetchone()
+    receiver_username = target_username[1:]
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT user_id FROM users WHERE username = ?", (receiver_username,))
+        row = await cursor.fetchone()
+        if not row:
+            await message.answer("❌ Пользователь не найден. Он должен хотя бы раз написать боту.")
+            return
+        receiver_id = row[0]
 
-    if not receiver:
-        await message.answer(f"❌ Пользователь {target_username} не найден. Убедитесь, что он уже писал боту.")
+    if sender_id == receiver_id:
+        await message.answer("❌ Нельзя перевести себе.")
         return
 
-    receiver_id, = receiver
-
-    if receiver_id == sender_id:
-        await message.answer("❌ Нельзя перевести самому себе.")
-        return
-
-    # Проверяем лимит
-    count_today = get_transfer_count_today(sender_id, receiver_id)
+    count_today = await get_transfer_count_today(sender_id, receiver_id)
     if count_today >= 3:
-        await message.answer("❌ Вы уже перевели 3 раза этому пользователю сегодня.")
+        await message.answer("❌ Лимит: 3 перевода в день одному пользователю.")
         return
 
-    # Выполняем перевод
-    update_balance(sender_id, -amount, message.from_user.username)
-    update_balance(receiver_id, amount, target_username[1:])
+    await update_balance(sender_id, -amount, message.from_user.username)
+    await update_balance(receiver_id, amount, receiver_username)
+    await add_transfer(sender_id, receiver_id, amount)
 
-    # === СОХРАНЯЕМ ПЕРЕВОД В ИСТОРИЮ ===
-    add_transfer(sender_id, receiver_id, amount)
-
-    # Уведомляем обоих
     try:
         await bot.send_message(sender_id, f"✅ Вы перевели {amount} блямзиков пользователю {target_username}.")
-    except Exception:
+    except TelegramForbiddenError:
         pass
 
     try:
         await bot.send_message(receiver_id, f"💰 Вам перевели {amount} блямзиков от @{message.from_user.username}!")
-    except Exception:
+    except TelegramForbiddenError:
         pass
 
-    await message.answer(f"✅ Перевод выполнен: @{message.from_user.username} → {target_username}: {amount} блямзиков.")
+    await message.answer(f"✅ Перевод выполнен: {amount} блямзиков → {target_username}.")
 
-# === АДМИН-КОМАНДЫ (работают только в ЛС) ===
+
+# === АДМИНКА (в ЛС) ===
 
 @dp.message(Command("admin"))
 async def cmd_admin(message: Message):
-    if not is_private_chat(message):
+    if not is_private(message):
         await message.answer(MSG_ONLY_IN_PRIVATE)
         return
     if not is_admin(message.from_user.id):
         await message.answer(MSG_ACCESS_DENIED)
         return
 
-    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text="📋 Заявки", callback_data="admin_requests")],
-        [types.InlineKeyboardButton(text="🛒 Магазин", callback_data="admin_shop")],
-        [types.InlineKeyboardButton(text="👥 Топ", callback_data="admin_top")],
-        [types.InlineKeyboardButton(text="📜 История", callback_data="admin_history")],
-        [types.InlineKeyboardButton(text="💰 Выдать/списать", callback_data="admin_adjust_menu")],
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Заявки", callback_data="admin_requests")],
+        [InlineKeyboardButton(text="🛒 Магазин", callback_data="admin_shop")],
+        [InlineKeyboardButton(text="👥 Топ", callback_data="admin_top")],
+        [InlineKeyboardButton(text="📜 История", callback_data="admin_history")],
+        [InlineKeyboardButton(text="💰 Выдать/списать", callback_data="admin_adjust_menu")],
     ])
-    await message.answer("Админ-панель:", reply_markup=keyboard)
+    await message.answer("🔐 Админ-панель:", reply_markup=kb)
+
 
 @dp.message(Command("adjust"))
 async def cmd_adjust(message: Message):
-    if not is_private_chat(message):
-        await message.answer(MSG_ONLY_IN_PRIVATE)
+    if not is_private(message) or not is_admin(message.from_user.id):
         return
-    if not is_admin(message.from_user.id):
-        await message.answer(MSG_ACCESS_DENIED)
+
+    parts = message.text.split()
+    if len(parts) != 3:
+        await message.answer("📌 Используйте: `/adjust USER_ID КОЛИЧЕСТВО`", parse_mode="Markdown")
         return
+
     try:
-        parts = message.text.split()
-        if len(parts) != 3:
-            raise ValueError()
         user_id = int(parts[1])
         amount = int(parts[2])
-
-        # Проверяем, существует ли пользователь
-        cursor.execute("SELECT username FROM users WHERE user_id = ?", (user_id,))
-        user = cursor.fetchone()
-        if not user:
-            await message.answer(f"❌ Пользователь с ID {user_id} не найден. Убедитесь, что он хотя бы раз написал боту.")
-            return
-
-        username = user[0]
-        update_balance(user_id, amount, username)
-        action = "начислено" if amount > 0 else "снято"
-        await message.answer(f"✅ {abs(amount)} блямзиков {action} пользователю @{username} (ID: {user_id}).")
-        try:
-            await bot.send_message(user_id, f"🔔 Админ {action} {abs(amount)} блямзиков. Новое значение: {get_user_balance(user_id)}")
-        except Exception:
-            pass
     except ValueError:
-        await message.answer("Используйте: /adjust USER_ID КОЛИЧЕСТВО\n(например: /adjust 123456789 50)")
-    except Exception as e:
-        logging.error(f"Ошибка в /adjust: {e}")
-        await message.answer("❌ Произошла ошибка. Проверьте логи.")
+        await message.answer("❌ USER_ID и КОЛИЧЕСТВО должны быть числами.")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT username FROM users WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        if not row:
+            await message.answer(f"❌ Пользователь {user_id} не найден.")
+            return
+        username = row[0]
+
+    await update_balance(user_id, amount, username)
+    action = "начислено" if amount > 0 else "списано"
+    new_balance = await get_user_balance(user_id)
+    await message.answer(
+        f"✅ {abs(amount)} блямзиков {action} пользователю @{username} (ID: {user_id}).\n"
+        f"Текущий баланс: {new_balance}."
+    )
+
+    try:
+        await bot.send_message(
+            user_id,
+            f"🔔 Администратор {action} {abs(amount)} блямзиков.\n"
+            f"Новый баланс: {new_balance}."
+        )
+    except TelegramForbiddenError:
+        pass
+
 
 @dp.message(Command("profile"))
 async def cmd_profile(message: Message):
-    if not is_private_chat(message):
-        await message.answer(MSG_ONLY_IN_PRIVATE)
+    if not is_private(message) or not is_admin(message.from_user.id):
         return
-    if not is_admin(message.from_user.id):
-        await message.answer(MSG_ACCESS_DENIED)
+
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("📌 Используйте: `/profile USER_ID`", parse_mode="Markdown")
         return
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("Используйте: /profile USER_ID")
-        return
+
     try:
-        user_id = int(args[1])
-        balance = get_user_balance(user_id)
-        cursor.execute("SELECT username FROM users WHERE user_id = ?", (user_id,))
-        user = cursor.fetchone()
-        if not user:
-            await message.answer("Пользователь не найден.")
-            return
-        username = user[0]
-
-        # === КНОПКА "ПЕРЕВЕСТИ" ===
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="💰 Перевести", callback_data=f"transfer_to_{user_id}")],
-            [types.InlineKeyboardButton(text="📊 Статистика", callback_data=f"stats_user_{user_id}")],
-            [types.InlineKeyboardButton(text=BACK_BUTTON, callback_data="back_to_main")]
-        ])
-
-        cursor.execute("SELECT COUNT(*) FROM requests WHERE user_id = ?", (user_id,))
-        total_requests = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM requests WHERE user_id = ? AND status = 'approved'", (user_id,))
-        approved = cursor.fetchone()[0]
-        await message.answer(
-            f"👤 Профиль @{username} (ID: {user_id})\n"
-            f"💰 Баланс: {balance} блямзиков\n"
-            f"📊 Заявок всего: {total_requests}\n"
-            f"✅ Одобрено: {approved}",
-            reply_markup=keyboard
-        )
+        user_id = int(parts[1])
     except ValueError:
-        await message.answer("Неверный ID.")
-
-# === КНОПКА "ПЕРЕВЕСТИ" В ПРОФИЛЕ ===
-@dp.callback_query(F.data.startswith("transfer_to_"))
-async def transfer_to_user(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
+        await message.answer("❌ ID должен быть числом.")
         return
 
-    target_user_id = int(call.data.split("_")[2])
-    await call.message.edit_text(f"Введите сумму для перевода пользователю с ID {target_user_id}:\n\nПример: /adjust {target_user_id} 50")
-    await call.answer()
+    balance = await get_user_balance(user_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT username FROM users WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        if not row:
+            await message.answer("❌ Пользователь не найден.")
+            return
+        username = row[0]
 
-# === АДМИН-ПАНЕЛЬ (все callback-функции тоже проверяют админа и ЛС) ===
+        cursor = await db.execute("SELECT COUNT(*) FROM requests WHERE user_id = ?", (user_id,))
+        total = (await cursor.fetchone())[0]
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM requests WHERE user_id = ? AND status = 'approved'", (user_id,)
+        )
+        approved = (await cursor.fetchone())[0]
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 Перевести", callback_data=f"transfer_to_{user_id}")],
+        [InlineKeyboardButton(text=BACK_BUTTON, callback_data="back_to_main")]
+    ])
+    await message.answer(
+        f"👤 **Профиль** @{username} (ID: {user_id})\n"
+        f"💰 Баланс: {balance}\n"
+        f"📊 Заявок: {total} (✅ {approved})",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
+
+
+# === CALLBACKS ===
 
 @dp.callback_query(F.data == "back_to_main")
 async def back_to_main_menu(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
-        return
-    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text="📋 Заявки", callback_data="admin_requests")],
-        [types.InlineKeyboardButton(text="🛒 Магазин", callback_data="admin_shop")],
-        [types.InlineKeyboardButton(text="👥 Топ", callback_data="admin_top")],
-        [types.InlineKeyboardButton(text="📜 История", callback_data="admin_history")],
-        [types.InlineKeyboardButton(text="💰 Выдать/списать", callback_data="admin_adjust_menu")],
-    ])
-    await call.message.edit_text("Админ-панель:", reply_markup=keyboard)
+    await cmd_admin(call.message)
     await call.answer()
+
 
 @dp.callback_query(F.data == "admin_requests")
 async def admin_requests(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
     if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
-        return
-    requests = get_pending_requests()
-    if not requests:
-        await call.message.edit_text("Нет новых заявок.", reply_markup=back_to_main())
-        await call.answer()
+        await call.answer(MSG_ACCESS_DENIED, show_alert=True)
         return
 
-    text = "📋 Новые заявки:\n\n"
-    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[])
-    for r in requests:
-        text += f"ID {r[0]} от @{r[2]}: {r[3]}\n"
-        keyboard.inline_keyboard.append([
-            types.InlineKeyboardButton(text=f"✅ Одобрить #{r[0]}", callback_data=f"approve_{r[0]}"),
-            types.InlineKeyboardButton(text=f"❌ Отклонить #{r[0]}", callback_data=f"decline_{r[0]}")
+    reqs = await get_pending_requests()
+    if not reqs:
+        await call.message.edit_text("📭 Нет новых заявок.", reply_markup=back_to_main_kb())
+        return
+
+    text = "📋 **Новые заявки**:\n\n"
+    buttons = []
+    for req_id, uid, uname, reason, _, _ in reqs:
+        text += f"#{req_id} от @{uname}: {reason[:30]}…\n"
+        buttons.append([
+            InlineKeyboardButton(text=f"✅ #{req_id}", callback_data=f"approve_{req_id}"),
+            InlineKeyboardButton(text=f"❌ #{req_id}", callback_data=f"decline_{req_id}")
         ])
-    keyboard.inline_keyboard.append([types.InlineKeyboardButton(text=BACK_BUTTON, callback_data="back_to_main")])
-    await call.message.edit_text(text, reply_markup=keyboard)
+    buttons.append([InlineKeyboardButton(text=BACK_BUTTON, callback_data="back_to_main")])
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
     await call.answer()
 
-# === Отправка медиа админу при одобрении/отклонении ===
 
-async def send_media_to_admin(req_id, user_id, reason, media_id, media_type, admin_id, action):
+async def send_media_to_admin(req_id: int, uid: int, reason: str, media_id: str, media_type: str, admin_id: int, action: str):
     try:
-        # Получаем юзернейм
-        user = await bot.get_chat(user_id)
-        username = user.username or "unknown"
-
-        caption = f"Заявка #{req_id} от @{username}\nПричина: {reason}\nДействие: {action}"
+        chat = await bot.get_chat(uid)
+        username = chat.username or "unknown"
+        caption = f"Заявка **#{req_id}** от @{username}\nПричина: {reason}\nСтатус: {action}"
 
         if media_id and media_type:
             if media_type == "photo":
-                await bot.send_photo(chat_id=admin_id, photo=media_id, caption=caption)
+                await bot.send_photo(admin_id, media_id, caption=caption, parse_mode="Markdown")
             elif media_type == "video":
-                await bot.send_video(chat_id=admin_id, video=media_id, caption=caption)
+                await bot.send_video(admin_id, media_id, caption=caption, parse_mode="Markdown")
             elif media_type == "document":
-                await bot.send_document(chat_id=admin_id, document=media_id, caption=caption)
+                await bot.send_document(admin_id, media_id, caption=caption, parse_mode="Markdown")
             elif media_type == "voice":
-                await bot.send_voice(chat_id=admin_id, voice=media_id, caption=caption)
+                await bot.send_voice(admin_id, media_id, caption=caption, parse_mode="Markdown")
             elif media_type == "audio":
-                await bot.send_audio(chat_id=admin_id, audio=media_id, caption=caption)
+                await bot.send_audio(admin_id, media_id, caption=caption, parse_mode="Markdown")
             elif media_type == "video_note":
-                await bot.send_video_note(chat_id=admin_id, video_note=media_id)
+                await bot.send_video_note(admin_id, media_id)
         else:
-            await bot.send_message(chat_id=admin_id, text=f"Заявка #{req_id} от @{username}\nПричина: {reason}\nДействие: {action}")
+            await bot.send_message(admin_id, caption, parse_mode="Markdown")
     except Exception as e:
-        logging.error(f"Ошибка при отправке медиа админу {admin_id}: {e}")
+        logger.error(f"Не удалось отправить медиа админу {admin_id}: {e}")
 
-async def get_user_id_by_req_id(req_id):
-    cursor.execute(SQL_GET_USER_ID_BY_REQ_ID, (req_id,))
-    result = cursor.fetchone()
-    return result[0] if result else None
 
 @dp.callback_query(F.data.startswith("approve_"))
 async def approve_request(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
     if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
+        await call.answer(MSG_ACCESS_DENIED, show_alert=True)
         return
-    req_id = int(call.data.split("_")[1])
-    cursor.execute("SELECT user_id, reason, media_id, media_type FROM requests WHERE id = ?", (req_id,))
-    row = cursor.fetchone()
-    if not row:
-        await call.answer("Заявка не найдена.", show_alert=True)
-        return
-    user_id, reason, media_id, media_type = row
 
-    update_request_status(req_id, 'approved', call.from_user.id)
+    req_id = int(call.data.split("_")[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT user_id, reason, media_id, media_type FROM requests WHERE id = ?",
+            (req_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            await call.answer("Заявка не найдена.", show_alert=True)
+            return
+        uid, reason, media_id, media_type = row
+
+    await update_request_status(req_id, "approved", call.from_user.id)
 
     try:
-        await bot.send_message(user_id, f"✅ Ваша заявка #{req_id} одобрена! 10 блямзиков зачислено.")
-    except Exception:
+        await bot.send_message(uid, f"✅ Ваша заявка **#{req_id}** одобрена! +10 блямзиков зачислено.", parse_mode="Markdown")
+    except TelegramForbiddenError:
         pass
 
-    await send_media_to_admin(req_id, user_id, reason, media_id, media_type, call.from_user.id, "✅ Одобрено")
+    await send_media_to_admin(req_id, uid, reason, media_id, media_type, call.from_user.id, "✅ Одобрено")
     await admin_requests(call)
+
 
 @dp.callback_query(F.data.startswith("decline_"))
 async def decline_request(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
     if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
+        await call.answer(MSG_ACCESS_DENIED, show_alert=True)
         return
-    req_id = int(call.data.split("_")[1])
-    cursor.execute("SELECT user_id, reason, media_id, media_type FROM requests WHERE id = ?", (req_id,))
-    row = cursor.fetchone()
-    if not row:
-        await call.answer("Заявка не найдена.", show_alert=True)
-        return
-    user_id, reason, media_id, media_type = row
 
-    update_request_status(req_id, 'declined', call.from_user.id)
+    req_id = int(call.data.split("_")[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT user_id, reason, media_id, media_type FROM requests WHERE id = ?",
+            (req_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            await call.answer("Заявка не найдена.", show_alert=True)
+            return
+        uid, reason, media_id, media_type = row
+
+    await update_request_status(req_id, "declined", call.from_user.id)
 
     try:
-        await bot.send_message(user_id, f"❌ Ваша заявка #{req_id} отклонена администратором.")
-    except Exception:
+        await bot.send_message(uid, f"❌ Ваша заявка **#{req_id}** отклонена.", parse_mode="Markdown")
+    except TelegramForbiddenError:
         pass
 
-    await send_media_to_admin(req_id, user_id, reason, media_id, media_type, call.from_user.id, "❌ Отклонено")
+    await send_media_to_admin(req_id, uid, reason, media_id, media_type, call.from_user.id, "❌ Отклонено")
     await admin_requests(call)
+
+
+@dp.callback_query(F.data.startswith("transfer_to_"))
+async def transfer_to_user(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer(MSG_ACCESS_DENIED, show_alert=True)
+        return
+    uid = int(call.data.split("_")[2])
+    await call.message.edit_text(f"Введите: `/adjust {uid} СУММА`", parse_mode="Markdown")
+    await call.answer()
+
 
 @dp.callback_query(F.data == "admin_shop")
 async def admin_shop(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
     if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
         return
-    items = get_shop_items()
-    text = "🛒 Товары в магазине:\n\n"
-    for item in items:
-        text += f"{item[0]}. {item[1]} — {item[2]} блямзиков\n"
-    text += "\nЧтобы добавить товар, нажмите кнопку ниже."
-    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add_item_prompt")],
-        [types.InlineKeyboardButton(text=BACK_BUTTON, callback_data="back_to_main")]
-    ])
-    await call.message.edit_text(text, reply_markup=keyboard)
-    await call.answer()
+    items = await get_shop_items()
+    text = "🛒 **Товары в магазине**:\n\n"
+    for item_id, name, price in items:
+        text += f"{item_id}. **{name}** — {price} блямзиков\n"
+    text += "\n➕ Отправьте `Название Цена` для добавления."
+    await call.message.edit_text(text, reply_markup=back_to_main_kb(), parse_mode="Markdown")
 
-@dp.callback_query(F.data == "admin_add_item_prompt")
-async def admin_add_item_prompt(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
-        return
-    await call.message.edit_text("Введите название товара и цену в формате:\n\nНазвание Цена")
-    await call.answer()
 
-# === Обработка добавления товара через чат ===
-@dp.message(F.text.regexp(r"^[^0-9].+ \d+$"))
+@dp.message(F.text.regexp(r"^[^0-9\s].+\s\d+$"))
 async def handle_add_item(message: Message):
-    if not is_private_chat(message):
-        return
-    if not is_admin(message.from_user.id):
-        await message.answer(MSG_ACCESS_DENIED)
+    if not is_private(message) or not is_admin(message.from_user.id):
         return
     try:
         parts = message.text.rsplit(" ", 1)
-        name = parts[0].strip()
-        price = int(parts[1])
-        add_item_to_shop(name, price)
-        await message.answer(f"Товар '{name}' добавлен в магазин за {price} блямзиков.")
-    except ValueError:
-        await message.answer("Неверный формат. Введите: Название Цена")
+        name, price = parts[0].strip(), int(parts[1])
+        await add_item_to_shop(name, price)
+        await message.answer(f"✅ Товар **{name}** за {price} блямзиков добавлен.", parse_mode="Markdown")
     except Exception:
-        await message.answer("Произошла ошибка при добавлении товара.")
+        await message.answer("❌ Ошибка. Формат: `Название 100`", parse_mode="Markdown")
+
 
 @dp.callback_query(F.data == "admin_top")
 async def admin_top(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
     if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
         return
-    top_users = get_top_users()
-    text = "🏆 Топ-10 пользователей:\n\n"
-    for i, user in enumerate(top_users, start=1):
-        text += f"{i}. @{user[1] or 'unknown'} — {user[2]} блямзиков\n"
-    await call.message.edit_text(text, reply_markup=back_to_main())
-    await call.answer()
+    users = await get_top_users()
+    text = "🏆 **Топ-10 пользователей**:\n\n"
+    for i, (uid, uname, bal) in enumerate(users, 1):
+        name = uname or f"id{uid}"
+        text += f"{i}. @{name} — {bal}\n"
+    await call.message.edit_text(text, reply_markup=back_to_main_kb(), parse_mode="Markdown")
+
 
 @dp.callback_query(F.data == "admin_history")
 async def admin_history(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
     if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
         return
-    history = get_request_history()
+    history = await get_request_history()
     if not history:
-        await call.message.edit_text("Нет истории заявок.", reply_markup=back_to_main())
+        await call.message.edit_text("📜 История пуста.", reply_markup=back_to_main_kb())
         return
-    text = "📜 История заявок (последние 20):\n\n"
-    for h in history:
-        text += f"ID {h[0]} от @{h[2]}: {h[3]} — {h[4]}\n"
-    await call.message.edit_text(text, reply_markup=back_to_main())
-    await call.answer()
+    text = "📜 **История заявок** (последние 20):\n\n"
+    for req_id, uid, uname, reason, status, _ in history:
+        text += f"#{req_id} @{uname}: {reason[:30]}… — {status}\n"
+    await call.message.edit_text(text, reply_markup=back_to_main_kb(), parse_mode="Markdown")
+
 
 @dp.callback_query(F.data == "admin_adjust_menu")
 async def admin_adjust_menu(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
-        return
-    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text="+10", callback_data="adjust_amount_10")],
-        [types.InlineKeyboardButton(text="+50", callback_data="adjust_amount_50")],
-        [types.InlineKeyboardButton(text="-10", callback_data="adjust_amount_neg_10")],
-        [types.InlineKeyboardButton(text="-50", callback_data="adjust_amount_neg_50")],
-        [types.InlineKeyboardButton(text="Другое", callback_data="adjust_custom")],
-        [types.InlineKeyboardButton(text="👤 Показать профиль", callback_data="show_profile")],
-        [types.InlineKeyboardButton(text=BACK_BUTTON, callback_data="back_to_main")]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="+10", callback_data="adjust_10")],
+        [InlineKeyboardButton(text="+50", callback_data="adjust_50")],
+        [InlineKeyboardButton(text="-10", callback_data="adjust_-10")],
+        [InlineKeyboardButton(text="-50", callback_data="adjust_-50")],
+        [InlineKeyboardButton(text="✏️ Другое", callback_data="adjust_custom")],
+        [InlineKeyboardButton(text="👤 Профиль", callback_data="adjust_profile")],
+        [InlineKeyboardButton(text=BACK_BUTTON, callback_data="back_to_main")]
     ])
-    await call.message.edit_text("Выберите действие:", reply_markup=keyboard)
-    await call.answer()
+    await call.message.edit_text("Выберите действие:", reply_markup=kb)
 
-@dp.callback_query(F.data.startswith("adjust_amount_"))
-async def admin_adjust_amount(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
+
+@dp.callback_query(F.data.startswith("adjust_"))
+async def adjust_amount(call: CallbackQuery):
     if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
         return
-    amount_str = call.data.split("_")[2]
-    if amount_str.startswith("neg_"):
-        amount = -int(amount_str[4:])
+    if call.data == "adjust_custom":
+        await call.message.edit_text("📌 Введите: `/adjust USER_ID КОЛИЧЕСТВО`", parse_mode="Markdown")
+    elif call.data == "adjust_profile":
+        await call.message.edit_text("📌 Введите: `/profile USER_ID`", parse_mode="Markdown")
     else:
-        amount = int(amount_str)
-
-    await call.message.edit_text(f"Вы выбрали: {'+' if amount > 0 else ''}{amount}\n\nТеперь введите:\n\n/adjust USER_ID {amount}")
+        amount = int(call.data.split("_")[1])
+        sign = "+" if amount > 0 else ""
+        await call.message.edit_text(f"📌 Введите: `/adjust USER_ID {sign}{amount}`", parse_mode="Markdown")
     await call.answer()
 
-@dp.callback_query(F.data == "adjust_custom")
-async def admin_adjust_custom(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
-        return
-    await call.message.edit_text("Введите команду вручную:\n\n/adjust USER_ID КОЛИЧЕСТВО\n\n(положительное — выдать, отрицательное — снять)")
-    await call.answer()
 
-@dp.callback_query(F.data == "show_profile")
-async def show_profile(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
-        return
-    await call.message.edit_text("Введите ID пользователя, чтобы посмотреть профиль:\n\nПример: /profile 123456789")
-    await call.answer()
-
-# === ФОНОВАЯ ЗАДАЧА: Напоминание о заявках ===
-async def check_pending_requests():  # noqa: S7503
+# === ФОНОВАЯ ЗАДАЧА ===
+async def remind_pending_requests():
     while True:
-        requests = get_pending_requests()
-        if requests:
+        reqs = await get_pending_requests()
+        if reqs:
             for admin_id in ADMINS:
                 try:
-                    text = "⏰ У вас есть необработанные заявки:\n"
-                    for r in requests:
-                        text += f"ID {r[0]} от @{r[2]}: {r[3]}\n"
-                    await bot.send_message(admin_id, text)
+                    text = "🔔 **Напоминание**\nНеобработанные заявки:\n" + "\n".join(
+                        f"• #{r[0]} от @{r[2]}" for r in reqs[:5]
+                    )
+                    if len(reqs) > 5:
+                        text += f"\n+{len(reqs) - 5} заявок"
+                    await bot.send_message(admin_id, text, parse_mode="Markdown")
                 except Exception as e:
-                    logging.error(f"Ошибка отправки напоминания админу {admin_id}: {e}")
-        await asyncio.sleep(86400)  # 24 часа
+                    logger.warning(f"Не удалось отправить админу {admin_id}: {e}")
+        await asyncio.sleep(21600)  # 6 часов
+
+
+# === ЗАПУСК ===
+async def main():
+    logger.info("🚀 Запуск бота...")
+    await init_db()
+    asyncio.create_task(remind_pending_requests())
+    await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
-    # Запуск фоновой задачи
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.create_task(check_pending_requests())
-    # Запуск бота
-    loop.run_until_complete(dp.start_polling(bot))
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("🛑 Бот остановлен.")
